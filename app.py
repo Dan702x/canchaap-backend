@@ -12,11 +12,22 @@ import jwt
 import random
 import string
 from flask_mail import Mail, Message
+from fpdf import FPDF
+from flask import send_file
+import io
 
 app = Flask(__name__)
 
 # Configura CORS
-CORS(app, resources={r"/api/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173"]}}, supports_credentials=True)
+CORS(
+    app, 
+    resources={r"/api/.*": {
+        "origins": ["http://localhost:5173", "http://127.0.0.1:5173"],
+        "methods": ["GET", "POST", "PUT", "DELETE"],
+        "supports_credentials": True,
+        "wildcard": True
+    }}
+)
 
 # Carga la clave secreta de JWT
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY')
@@ -94,35 +105,67 @@ def send_reminder_email(to_email, first_name, cancha_nombre, sede_nombre, fecha_
 def get_canchas():
     id_usuario = get_user_id_from_token() 
     try:
+        # --- ¡NUEVO! Capturamos filtros ---
+        filtro_ubicacion = request.args.get('ubicacion')
+        filtro_deporte = request.args.get('deporte')
+        
         conn = get_db_connection()
         if conn is None:
             return jsonify({"error": "Error de conexión a la base de datos"}), 500
         cursor = conn.cursor(dictionary=True)
+        
         query = """
             SELECT 
-                c.id_cancha, c.nombre, c.descripcion, c.foto,
-                s.ubicacion_texto,
+                c.id_cancha, c.nombre, c.descripcion, c.foto, c.estado,
+                s.ubicacion_texto, s.latitud, s.longitud,
                 MIN(t.precio_por_hora) AS precio_por_hora,
-                MAX(f.id_usuario IS NOT NULL) AS is_favorito 
+                MAX(f.id_usuario IS NOT NULL) AS is_favorito,
+                td.nombre AS tipo_deporte -- ¡AÑADIDO!
             FROM canchas c
             JOIN sedes s ON c.id_sede = s.id_sede
+            LEFT JOIN tipos_deporte td ON c.id_tipo_deporte = td.id_tipo_deporte -- ¡AÑADIDO!
             LEFT JOIN tarifas t ON c.id_cancha = t.id_cancha
             LEFT JOIN favoritos f ON c.id_cancha = f.id_cancha AND f.id_usuario = %s
-            WHERE c.estado = 1
-            GROUP BY c.id_cancha, c.nombre, c.descripcion, c.foto, s.ubicacion_texto;
         """
-        cursor.execute(query, (id_usuario,))
+        params = [id_usuario]
+        
+        # --- ¡NUEVO! Lógica de filtros ---
+        where_clauses = []
+        
+        if filtro_ubicacion:
+            where_clauses.append("s.ubicacion_texto LIKE %s")
+            params.append(f"%{filtro_ubicacion}%") # Busca por distrito
+            
+        if filtro_deporte:
+            where_clauses.append("c.id_tipo_deporte = %s")
+            params.append(filtro_deporte)
+            
+        if where_clauses:
+            query += " WHERE " + " AND ".join(where_clauses)
+        # --- FIN Lógica de filtros ---
+
+        query += """
+            GROUP BY c.id_cancha, c.nombre, c.descripcion, c.foto, c.estado, 
+                     s.ubicacion_texto, s.latitud, s.longitud, td.nombre
+            ORDER BY is_favorito DESC, c.nombre ASC -- ¡ORDENAMIENTO AÑADIDO!
+        """
+        
+        cursor.execute(query, tuple(params))
         rows = cursor.fetchall()
+        
         canchas = []
         for c in rows:
             canchas.append({
                 "id": c['id_cancha'], "nombre": c['nombre'], "ubicacion": c['ubicacion_texto'],
                 "precio": c['precio_por_hora'] or 0,
                 "imagen": c['foto'] or 'https://placehold.co/400x300/CCCCCC/FFFFFF?text=Sin+Imagen',
-                "lat": -12.1084 + (os.urandom(1)[0] / 255 - 0.5) * 0.1,
-                "lng": -77.0031 + (os.urandom(1)[0] / 255 - 0.5) * 0.1,
-                "is_favorito": bool(c['is_favorito']) 
+                "lat": c['latitud'] or 0.0,
+                "lng": c['longitud'] or 0.0,
+                "is_favorito": bool(c['is_favorito']),
+                "estado": bool(c['estado']),
+                "tipo_deporte": c['tipo_deporte'] # ¡AÑADIDO!
             })
+        
         cursor.close()
         conn.close()
         return json.dumps(canchas, default=json_converter), 200, {'Content-Type': 'application/json'}
@@ -175,6 +218,8 @@ def get_cancha_detalle(id):
             "rating": sum(r['calificacion'] for r in reseñas) / len(reseñas) if reseñas else 4.5,
             "is_favorito": bool(cancha['is_favorito']),
             "description": cancha['descripcion'],
+            "tipo_deporte": cancha['tipo_deporte'],
+            "tipo_superficie": cancha['tipo_superficie'],
             "gallery": [
                 cancha['foto'] or 'https://placehold.co/600x400/CCCCCC/FFFFFF?text=Foto+Principal',
                 'https://placehold.co/200x150/CCCCCC/FFFFFF?text=Foto+2',
@@ -366,7 +411,17 @@ def login_usuario():
         if conn is None: return jsonify({"error": "Error de conexión"}), 500
         
         cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM usuarios WHERE email = %s", (email,))
+        query = """
+        SELECT 
+            u.id_usuario, u.first_name, u.last_name, u.email, u.documento, 
+            u.telefono, u.recibir_notificaciones, u.id_rol, u.password, u.is_verified,
+            e.estado AS empresa_estado,
+            e.id_empresa
+        FROM usuarios u
+        LEFT JOIN empresas e ON u.id_usuario = e.id_usuario_admin
+        WHERE u.email = %s
+        """
+        cursor.execute(query, (email,))
         usuario = cursor.fetchone()
         
         if not usuario:
@@ -402,7 +457,9 @@ def login_usuario():
                 "id_usuario": usuario['id_usuario'],
                 "email": usuario['email'],
                 "first_name": usuario['first_name'],
-                "last_name": usuario['last_name']
+                "last_name": usuario['last_name'],
+                "id_rol": usuario['id_rol'],
+                "empresa_estado": usuario.get('empresa_estado')
             },
             "token": token
         }
@@ -447,11 +504,17 @@ def manejar_perfil():
             if conn is None: return jsonify({"error": "Error de conexión"}), 500
             
             cursor = conn.cursor(dictionary=True)
-            # ¡CAMBIO! Traemos el nuevo campo
-            cursor.execute(
-                "SELECT id_usuario, first_name, last_name, email, documento, telefono, recibir_notificaciones FROM usuarios WHERE id_usuario = %s", 
-                (id_usuario,) 
-            )
+            query = """
+                SELECT 
+                    u.id_usuario, u.first_name, u.last_name, u.email, u.documento, 
+                    u.telefono, u.recibir_notificaciones, u.id_rol, -- <-- ¡AQUÍ ESTÁ EL ARREGLO!
+                    e.estado AS empresa_estado,
+                    e.id_empresa
+                FROM usuarios u
+                LEFT JOIN empresas e ON u.id_usuario = e.id_usuario_admin
+                WHERE u.id_usuario = %s
+            """
+            cursor.execute(query, (id_usuario,))
             usuario = cursor.fetchone()
             cursor.close()
             conn.close()
@@ -780,7 +843,7 @@ def manejar_favoritos():
             cursor = conn.cursor(dictionary=True)
             query = """
                 SELECT 
-                    c.id_cancha, c.nombre, c.foto,
+                    c.id_cancha, c.nombre, c.foto, c.estado,
                     s.ubicacion_texto,
                     MIN(t.precio_por_hora) AS precio_por_hora,
                     f.fecha_agregado
@@ -789,7 +852,7 @@ def manejar_favoritos():
                 JOIN sedes s ON c.id_sede = s.id_sede
                 LEFT JOIN tarifas t ON c.id_cancha = t.id_cancha
                 WHERE f.id_usuario = %s
-                GROUP BY c.id_cancha, c.nombre, c.foto, s.ubicacion_texto, f.fecha_agregado
+                GROUP BY c.id_cancha, c.nombre, c.foto, c.estado, s.ubicacion_texto, f.fecha_agregado
                 ORDER BY f.fecha_agregado DESC;
             """
             cursor.execute(query, (id_usuario,))
@@ -802,7 +865,8 @@ def manejar_favoritos():
                     "ubicacion": f['ubicacion_texto'],
                     "precio": f['precio_por_hora'] or 0,
                     "imagen": f['foto'] or 'https://placehold.co/400x300/CCCCCC/FFFFFF?text=Sin+Imagen',
-                    "fecha_agregado": f['fecha_agregado']
+                    "fecha_agregado": f['fecha_agregado'],
+                    "estado": bool(f['estado'])
                 })
             cursor.close()
             conn.close()
@@ -999,6 +1063,1165 @@ def send_reminders():
         print(f"¡ERROR GRAVE en /api/tasks/send-reminders!: {e}")
         return jsonify({"error": "Error interno del servidor al procesar recordatorios"}), 500
 
+# --- ¡NUEVO ENDPOINT PARA LIMPIAR RESERVAS PENDIENTES! ---
+@app.route('/api/tasks/clean-pending-reservations', methods=['POST', 'OPTIONS'])
+def clean_pending_reservations():
+    # 1. Verificamos la clave secreta del Cron Job
+    auth_header = request.headers.get('Authorization')
+    secret_key = auth_header.split(' ')[1] if auth_header else None
+
+    if not secret_key or secret_key != app.config['CRON_SECRET_KEY']:
+        print("¡Intento fallido de ejecutar clean-pending! Clave secreta incorrecta.")
+        return jsonify({"error": "No autorizado"}), 401
+
+    print("--- [SCHEDULER]: Iniciando tarea de limpieza de reservas pendientes ---")
+
+    try:
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+
+        # 2. Buscamos reservas pendientes creadas hace más de 60 minutos
+        # Tu tabla 'reservas' ya tiene 'fecha_creacion'
+        query = """
+            UPDATE reservas
+            SET estado = 'cancelada'
+            WHERE 
+                estado = 'pendiente'
+                AND fecha_creacion < (NOW() - INTERVAL 60 MINUTE);
+        """
+        cursor.execute(query)
+        conn.commit()
+
+        count = cursor.rowcount # Vemos cuántas filas se actualizaron (cancelaron)
+
+        cursor.close()
+        conn.close()
+
+        print(f"--- [SCHEDULER]: Tarea finalizada. {count} reservas pendientes fueron canceladas. ---")
+        return jsonify({"mensaje": f"{count} reservas pendientes canceladas."}), 200
+
+    except Exception as e:
+        conn.rollback()
+        print(f"¡ERROR GRAVE en /api/tasks/clean-pending-reservations!: {e}")
+        return jsonify({"error": "Error interno al procesar la limpieza"}), 500
+    
+# --- (Endpoints de Gestión de Empresas - SPRINT 4) ---
+
+@app.route('/api/empresas/solicitar-registro', methods=['POST'])
+def solicitar_registro_empresa():
+    id_usuario = get_user_id_from_token()
+    if not id_usuario:
+        return jsonify({"error": "No autorizado. Debes iniciar sesión."}), 401
+
+    try:
+        data = request.json
+        nombre = data.get('nombre')
+        ruc = data.get('ruc')
+        descripcion = data.get('descripcion')
+        
+        if not nombre or not ruc:
+            return jsonify({"error": "El nombre y RUC son obligatorios."}), 400
+
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+
+        # 1. Verificar si el usuario ya tiene una empresa
+        cursor.execute("SELECT id_empresa, estado FROM empresas WHERE id_usuario_admin = %s", (id_usuario,))
+        empresa_existente = cursor.fetchone()
+        
+        if empresa_existente:
+            cursor.close()
+            conn.close()
+            return jsonify({"error": f"Ya tienes una solicitud en estado: {empresa_existente['estado']}."}), 409
+        
+        # 2. Insertar la nueva solicitud de empresa
+        query = """
+            INSERT INTO empresas (id_usuario_admin, nombre, ruc, descripcion, estado)
+            VALUES (%s, %s, %s, %s, 'pendiente')
+        """
+        cursor.execute(query, (id_usuario, nombre, ruc, descripcion))
+        conn.commit()
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify({"mensaje": "Solicitud de registro de empresa enviada. Un administrador la revisará."}), 201
+
+    except mysql.connector.Error as err:
+        if err.errno == 1062: # Error de RUC duplicado
+            return jsonify({"error": "El RUC ingresado ya está registrado por otra empresa."}), 409
+        print(f"Error en POST /api/empresas/solicitar-registro: {err}")
+        return jsonify({"error": "Error al enviar la solicitud"}), 500
+    except Exception as e:
+        print(f"Error: {e}")
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+@app.route('/api/admin/empresas', methods=['GET'])
+def get_empresas():
+    id_usuario_admin = get_user_id_from_token()
+    if not id_usuario_admin:
+        return jsonify({"error": "No autorizado."}), 401
+    
+    try:
+        # ¡NUEVO! Capturamos el filtro de estado
+        filtro_estado = request.args.get('estado')
+        
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+
+        # 1. Validar que el usuario sea Administrador (rol 2)
+        cursor.execute("SELECT id_rol FROM usuarios WHERE id_usuario = %s", (id_usuario_admin,))
+        admin = cursor.fetchone()
+        
+        if not admin or admin['id_rol'] != 2:
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "Acceso denegado. No eres administrador."}), 403
+
+        # 2. Obtener empresas con filtro
+        query = """
+            SELECT e.id_empresa, e.nombre, e.ruc, e.descripcion, e.estado, u.email
+            FROM empresas e
+            JOIN usuarios u ON e.id_usuario_admin = u.id_usuario
+        """
+        params = []
+        
+        # ¡NUEVO! Añadimos el filtro si existe
+        if filtro_estado:
+            query += " WHERE e.estado = %s"
+            params.append(filtro_estado)
+            
+        query += " ORDER BY e.fecha_creacion DESC"
+        
+        cursor.execute(query, tuple(params))
+        empresas = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        return json.dumps(empresas, default=json_converter), 200, {'Content-Type': 'application/json'}
+
+    except Exception as e:
+        print(f"Error en GET /api/admin/empresas: {e}")
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+@app.route('/api/admin/solicitudes/<int:id_empresa>', methods=['PUT'])
+def gestionar_solicitud(id_empresa):
+    id_usuario_admin = get_user_id_from_token()
+    if not id_usuario_admin:
+        return jsonify({"error": "No autorizado."}), 401
+
+    try:
+        data = request.json
+        accion = data.get('accion') # 'aprobar' o 'rechazar'
+        
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+        
+        # 1. Validar que el usuario sea Administrador (rol 2)
+        cursor.execute("SELECT id_rol FROM usuarios WHERE id_usuario = %s", (id_usuario_admin,))
+        admin = cursor.fetchone()
+        
+        if not admin or admin['id_rol'] != 2:
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "Acceso denegado."}), 403
+
+        # 2. Determinar el nuevo estado y actualizar
+        if accion == 'aprobar':
+            query = "UPDATE empresas SET estado = 'activo', motivo_rechazo = NULL WHERE id_empresa = %s AND estado = 'pendiente'"
+            params = (id_empresa,)
+            mensaje = "Solicitud marcada como 'activo'."
+            
+        elif accion == 'rechazar':
+            motivo = data.get('motivo', 'Rechazado por el administrador.') # Captura el motivo
+            query = "UPDATE empresas SET estado = 'rechazado', motivo_rechazo = %s WHERE id_empresa = %s AND estado = 'pendiente'"
+            params = (motivo, id_empresa)
+            mensaje = "Solicitud marcada como 'rechazado'."
+            
+        else:
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "Acción no válida. Debe ser 'aprobar' o 'rechazar'."}), 400
+            
+        # 3. Ejecutar la actualización
+        cursor.execute(query, params)
+        conn.commit()
+        
+        affected_rows = cursor.rowcount
+        cursor.close()
+        conn.close()
+
+        if affected_rows == 0:
+            return jsonify({"error": "No se encontró la solicitud pendiente o ya fue gestionada."}), 404
+        
+        return jsonify({"mensaje": mensaje}), 200
+        
+    except Exception as e:
+        conn.rollback() # ¡Añadimos rollback por si falla!
+        print(f"Error en PUT /api/admin/solicitudes/<id>: {e}")
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+# --- (Helper para obtener la empresa del usuario logueado) ---
+def get_empresa_id_from_token():
+    id_usuario = get_user_id_from_token()
+    if not id_usuario:
+        return None, "No autorizado. Debes iniciar sesión."
+
+    try:
+        conn = get_db_connection()
+        if conn is None:
+            return None, "Error de conexión."
+        
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT id_empresa, estado FROM empresas WHERE id_usuario_admin = %s", (id_usuario,))
+        empresa = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        if not empresa:
+            return None, "Este usuario no está asociado a ninguna empresa."
+        if empresa['estado'] != 'activo':
+            return None, f"El estado de tu empresa es '{empresa['estado']}'. No puedes gestionar canchas."
+            
+        return empresa['id_empresa'], None
+    except Exception as e:
+        print(f"Error en get_empresa_id_from_token: {e}")
+        return None, "Error interno al verificar la empresa."
+
+
+# --- (Endpoints de Gestión de Sedes - SPRINT 4) ---
+
+@app.route('/api/empresa/sedes', methods=['GET'])
+def get_mis_sedes():
+    id_empresa, error_msg = get_empresa_id_from_token()
+    if error_msg:
+        return jsonify({"error": error_msg}), 403 # 403 = Prohibido
+
+    try:
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+        
+        query = "SELECT * FROM sedes WHERE id_empresa = %s ORDER BY nombre_sede"
+        cursor.execute(query, (id_empresa,))
+        sedes = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        return json.dumps(sedes, default=json_converter), 200, {'Content-Type': 'application/json'}
+
+    except Exception as e:
+        print(f"Error en GET /api/empresa/sedes: {e}")
+        return jsonify({"error": "Error al obtener las sedes"}), 500
+
+@app.route('/api/empresa/sedes', methods=['POST'])
+def crear_nueva_sede():
+    id_empresa, error_msg = get_empresa_id_from_token()
+    if error_msg:
+        return jsonify({"error": error_msg}), 403
+
+    try:
+        data = request.json
+        nombre_sede = data.get('nombre_sede')
+        ubicacion_texto = data.get('ubicacion_texto')
+
+        # --- ¡ESTA ES LA CORRECCIÓN! ---
+        # Convertimos los valores a float o los dejamos como None
+
+        lat_str = data.get('latitud')
+        lng_str = data.get('longitud')
+
+        # Si el string no está vacío, lo convertimos a float. Si está vacío o es None, lo dejamos como None.
+        latitud = float(lat_str) if lat_str else None
+        longitud = float(lng_str) if lng_str else None
+        # --- FIN DE LA CORRECCIÓN ---
+
+        if not nombre_sede or not ubicacion_texto:
+            return jsonify({"error": "El nombre de la sede y la ubicación son obligatorios."}), 400
+
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+        
+        # ¡NUEVO! Consulta actualizada
+        query = """
+            INSERT INTO sedes (id_empresa, nombre_sede, ubicacion_texto, latitud, longitud)
+            VALUES (%s, %s, %s, %s, %s)
+        """
+        cursor.execute(query, (id_empresa, nombre_sede, ubicacion_texto, latitud, longitud))
+        conn.commit()
+        id_sede = cursor.lastrowid
+        
+        cursor.close()
+        conn.close()
+        
+        # ¡NUEVO! Devolvemos los nuevos campos
+        return jsonify({
+            "id_sede": id_sede, 
+            "id_empresa": id_empresa,
+            "nombre_sede": nombre_sede, 
+            "ubicacion_texto": ubicacion_texto,
+            "latitud": latitud,
+            "longitud": longitud
+        }), 201
+
+    except Exception as e:
+        conn.rollback() # <-- ¡AÑADIDO!
+        print(f"Error en POST /api/empresa/sedes: {e}")
+        return jsonify({"error": "Error al crear la sede"}), 500
+    
+@app.route('/api/empresa/sedes/<int:id_sede>', methods=['PUT'])
+def actualizar_sede(id_sede):
+    id_empresa, error_msg = get_empresa_id_from_token()
+    if error_msg:
+        return jsonify({"error": error_msg}), 403
+
+    try:
+        data = request.json
+        nombre_sede = data.get('nombre_sede')
+        ubicacion_texto = data.get('ubicacion_texto')
+        latitud = float(data.get('latitud')) if data.get('latitud') else None
+        longitud = float(data.get('longitud')) if data.get('longitud') else None
+
+        if not nombre_sede or not ubicacion_texto:
+            return jsonify({"error": "El nombre y la dirección son obligatorios."}), 400
+
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+        
+        # Actualizamos la sede, asegurándonos que pertenezca a la empresa
+        query = """
+            UPDATE sedes SET 
+                nombre_sede = %s, 
+                ubicacion_texto = %s, 
+                latitud = %s, 
+                longitud = %s
+            WHERE id_sede = %s AND id_empresa = %s
+        """
+        cursor.execute(query, (nombre_sede, ubicacion_texto, latitud, longitud, id_sede, id_empresa))
+        conn.commit()
+        
+        affected_rows = cursor.rowcount
+        cursor.close()
+        conn.close()
+        
+        if affected_rows == 0:
+            return jsonify({"error": "No se pudo actualizar la sede. No se encontró o no te pertenece."}), 404
+        
+        return jsonify({
+            "id_sede": id_sede, "nombre_sede": nombre_sede, "ubicacion_texto": ubicacion_texto,
+            "latitud": latitud, "longitud": longitud
+        }), 200
+
+    except Exception as e:
+        conn.rollback()
+        print(f"Error en PUT /api/empresa/sedes/<id>: {e}")
+        return jsonify({"error": "Error al actualizar la sede"}), 500
+
+@app.route('/api/empresa/sedes/<int:id_sede>', methods=['DELETE'])
+def eliminar_sede(id_sede):
+    id_empresa, error_msg = get_empresa_id_from_token()
+    if error_msg:
+        return jsonify({"error": error_msg}), 403
+
+    try:
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+        
+        # Eliminamos la sede, asegurándonos que pertenezca a la empresa
+        query = "DELETE FROM sedes WHERE id_sede = %s AND id_empresa = %s"
+        cursor.execute(query, (id_sede, id_empresa))
+        conn.commit()
+        
+        affected_rows = cursor.rowcount
+        cursor.close()
+        conn.close()
+        
+        if affected_rows == 0:
+            return jsonify({"error": "No se pudo eliminar la sede. No se encontró o no te pertenece."}), 404
+            
+        return jsonify({"mensaje": "Sede eliminada exitosamente"}), 200
+
+    except mysql.connector.Error as err:
+        conn.rollback()
+        # Error de llave foránea (si la sede tiene canchas)
+        if err.errno == 1451: 
+            return jsonify({"error": "No se puede eliminar la sede porque tiene canchas asociadas. Primero elimina sus canchas."}), 409
+        print(f"Error en DELETE /api/empresa/sedes/<id>: {err}")
+        return jsonify({"error": "Error al eliminar la sede"}), 500
+
+# --- (Endpoints de Catálogos - SPRINT 4) ---
+
+@app.route('/api/catalogos/tipos-deporte', methods=['GET'])
+def get_tipos_deporte():
+    try:
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT id_tipo_deporte, nombre FROM tipos_deporte ORDER BY nombre")
+        tipos = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return jsonify(tipos)
+    except Exception as e:
+        print(f"Error en GET /api/catalogos/tipos-deporte: {e}")
+        return jsonify({"error": "Error al obtener tipos de deporte"}), 500
+
+@app.route('/api/catalogos/tipos-superficie', methods=['GET'])
+def get_tipos_superficie():
+    try:
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT id_tipo_superficie, nombre FROM tipos_superficie ORDER BY nombre")
+        tipos = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return jsonify(tipos)
+    except Exception as e:
+        print(f"Error en GET /api/catalogos/tipos-superficie: {e}")
+        return jsonify({"error": "Error al obtener tipos de superficie"}), 500
+
+
+# --- (Endpoints de Gestión de Canchas - SPRINT 4) ---
+
+@app.route('/api/empresa/canchas', methods=['GET'])
+def get_mis_canchas():
+    id_empresa, error_msg = get_empresa_id_from_token()
+    if error_msg:
+        return jsonify({"error": error_msg}), 403
+
+    try:
+        # --- ¡NUEVO! Capturamos los filtros de la URL ---
+        filtro_sede_id = request.args.get('sede')
+        filtro_deporte_id = request.args.get('deporte')
+        # --- FIN NUEVO ---
+
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+        
+        # Consulta base
+        query = """
+            SELECT 
+                c.id_cancha, c.nombre, c.descripcion, c.foto, c.estado,
+                s.id_sede, s.nombre_sede,
+                t.nombre AS tipo_deporte,
+                ts.id_tipo_superficie, ts.nombre AS tipo_superficie,
+                c.id_tipo_deporte,
+                tar.precio_por_hora
+            FROM canchas c
+            JOIN sedes s ON c.id_sede = s.id_sede
+            LEFT JOIN tipos_deporte t ON c.id_tipo_deporte = t.id_tipo_deporte
+            LEFT JOIN tipos_superficie ts ON c.id_tipo_superficie = ts.id_tipo_superficie
+            LEFT JOIN tarifas tar ON c.id_cancha = tar.id_cancha
+            WHERE s.id_empresa = %s
+        """
+        params = [id_empresa]
+
+        # --- ¡NUEVO! Añadimos filtros dinámicos a la consulta ---
+        if filtro_sede_id:
+            query += " AND s.id_sede = %s"
+            params.append(filtro_sede_id)
+            
+        if filtro_deporte_id:
+            query += " AND c.id_tipo_deporte = %s"
+            params.append(filtro_deporte_id)
+        # --- FIN NUEVO ---
+            
+        query += """
+            GROUP BY c.id_cancha, c.nombre, c.descripcion, c.foto, c.estado,
+                     s.id_sede, s.nombre_sede, t.nombre, ts.id_tipo_superficie, 
+                     ts.nombre, c.id_tipo_deporte, tar.precio_por_hora
+            ORDER BY s.nombre_sede, c.nombre
+        """
+        
+        cursor.execute(query, tuple(params)) # Ejecutamos la consulta con los parámetros
+        canchas = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        return json.dumps(canchas, default=json_converter), 200, {'Content-Type': 'application/json'}
+
+    except Exception as e:
+        print(f"Error en GET /api/empresa/canchas: {e}")
+        return jsonify({"error": "Error al obtener las canchas"}), 500
+
+@app.route('/api/empresa/canchas', methods=['POST'])
+def crear_nueva_cancha():
+    id_empresa, error_msg = get_empresa_id_from_token()
+    if error_msg:
+        return jsonify({"error": error_msg}), 403
+
+    try:
+        data = request.json
+        # Validamos campos obligatorios
+        id_sede = data.get('id_sede')
+        id_tipo_deporte = data.get('id_tipo_deporte')
+        nombre = data.get('nombre')
+        precio_por_hora = data.get('precio_por_hora')
+        
+        if not all([id_sede, id_tipo_deporte, nombre, precio_por_hora]):
+            return jsonify({"error": "Faltan campos obligatorios: sede, tipo de deporte, nombre y precio."}), 400
+
+        # Campos opcionales
+        id_tipo_superficie = data.get('id_tipo_superficie') or None
+        descripcion = data.get('descripcion') or None
+        foto = data.get('foto') or None
+
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+        
+        # Verificamos que la sede pertenezca a la empresa
+        cursor.execute("SELECT id_sede FROM sedes WHERE id_sede = %s AND id_empresa = %s", (id_sede, id_empresa))
+        sede_valida = cursor.fetchone()
+        if not sede_valida:
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "La sede seleccionada no te pertenece."}), 403
+
+        # Insertamos la cancha
+        query_cancha = """
+            INSERT INTO canchas (id_sede, id_tipo_deporte, id_tipo_superficie, nombre, descripcion, foto, estado)
+            VALUES (%s, %s, %s, %s, %s, %s, 1)
+        """
+        cursor.execute(query_cancha, (
+            id_sede, id_tipo_deporte, id_tipo_superficie, 
+            nombre, descripcion, foto
+        ))
+        id_cancha = cursor.lastrowid
+        
+        # Insertamos la tarifa base para esta cancha
+        query_tarifa = """
+            INSERT INTO tarifas (id_cancha, descripcion, precio_por_hora)
+            VALUES (%s, %s, %s)
+        """
+        cursor.execute(query_tarifa, (id_cancha, 'Tarifa General', precio_por_hora))
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        # Devolvemos un mensaje simple, luego el frontend recargará la lista
+        return jsonify({"mensaje": "Cancha creada exitosamente", "id_cancha": id_cancha}), 201
+
+    except Exception as e:
+        conn.rollback() # Aseguramos revertir si algo falla
+        print(f"Error en POST /api/empresa/canchas: {e}")
+        return jsonify({"error": "Error al crear la cancha"}), 500
+
+@app.route('/api/empresa/canchas/<int:id_cancha>', methods=['PUT'])
+def actualizar_cancha(id_cancha):
+    id_empresa, error_msg = get_empresa_id_from_token()
+    if error_msg:
+        return jsonify({"error": error_msg}), 403
+
+    try:
+        data = request.json
+        # Campos de la tabla 'canchas'
+        id_sede = data.get('id_sede')
+        id_tipo_deporte = data.get('id_tipo_deporte')
+        nombre = data.get('nombre')
+        # Campos opcionales de 'canchas'
+        id_tipo_superficie = data.get('id_tipo_superficie') or None
+        descripcion = data.get('descripcion') or None
+        foto = data.get('foto') or None
+        # Campo de la tabla 'tarifas'
+        precio_por_hora = data.get('precio_por_hora')
+
+        if not all([id_sede, id_tipo_deporte, nombre, precio_por_hora]):
+            return jsonify({"error": "Faltan campos obligatorios."}), 400
+
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+
+        # 1. Verificamos que la cancha y la sede pertenezcan a la empresa
+        cursor.execute("""
+            SELECT c.id_cancha FROM canchas c JOIN sedes s ON c.id_sede = s.id_sede
+            WHERE c.id_cancha = %s AND s.id_empresa = %s
+        """, (id_cancha, id_empresa))
+        cancha_valida = cursor.fetchone()
+        
+        cursor.execute("SELECT id_sede FROM sedes WHERE id_sede = %s AND id_empresa = %s", (id_sede, id_empresa))
+        sede_valida = cursor.fetchone()
+        
+        if not cancha_valida or not sede_valida:
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "No tienes permiso para editar esta cancha o esta sede no te pertenece."}), 403
+
+        # 2. Actualizamos la tabla 'canchas'
+        query_cancha = """
+            UPDATE canchas SET
+                id_sede = %s, id_tipo_deporte = %s, id_tipo_superficie = %s,
+                nombre = %s, descripcion = %s, foto = %s
+            WHERE id_cancha = %s
+        """
+        cursor.execute(query_cancha, (
+            id_sede, id_tipo_deporte, id_tipo_superficie, 
+            nombre, descripcion, foto, id_cancha
+        ))
+
+        # 3. Actualizamos la tabla 'tarifas' (asumiendo una tarifa general por cancha)
+        query_tarifa = "UPDATE tarifas SET precio_por_hora = %s WHERE id_cancha = %s"
+        cursor.execute(query_tarifa, (precio_por_hora, id_cancha))
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        return jsonify({"mensaje": "Cancha actualizada exitosamente"}), 200
+
+    except Exception as e:
+        conn.rollback()
+        print(f"Error en PUT /api/empresa/canchas/<id>: {e}")
+        return jsonify({"error": "Error al actualizar la cancha"}), 500
+
+@app.route('/api/empresa/canchas/<int:id_cancha>/estado', methods=['PUT'])
+def cambiar_estado_cancha(id_cancha):
+    id_empresa, error_msg = get_empresa_id_from_token()
+    if error_msg:
+        return jsonify({"error": error_msg}), 403
+
+    try:
+        data = request.json
+        nuevo_estado = bool(data.get('estado')) # Convertimos a 1 o 0
+
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+
+        # Verificamos que la cancha pertenezca a la empresa
+        query_check = """
+            SELECT c.id_cancha FROM canchas c JOIN sedes s ON c.id_sede = s.id_sede
+            WHERE c.id_cancha = %s AND s.id_empresa = %s
+        """
+        cursor.execute(query_check, (id_cancha, id_empresa))
+        cancha_valida = cursor.fetchone()
+        
+        if not cancha_valida:
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "No tienes permiso para modificar esta cancha."}), 403
+
+        # Actualizamos el estado
+        query_update = "UPDATE canchas SET estado = %s WHERE id_cancha = %s"
+        cursor.execute(query_update, (nuevo_estado, id_cancha))
+        conn.commit()
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify({"mensaje": f"Estado de la cancha actualizado a {'activo' if nuevo_estado else 'inactivo'}"}), 200
+
+    except Exception as e:
+        conn.rollback()
+        print(f"Error en PUT /api/empresa/canchas/<id>/estado: {e}")
+        return jsonify({"error": "Error al cambiar el estado de la cancha"}), 500
+
+@app.route('/api/empresa/canchas/<int:id_cancha>', methods=['DELETE'])
+def eliminar_cancha(id_cancha):
+    id_empresa, error_msg = get_empresa_id_from_token()
+    if error_msg:
+        return jsonify({"error": error_msg}), 403
+
+    try:
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+
+        # 1. Verificamos que la cancha pertenezca a la empresa
+        query_check = """
+            SELECT c.id_cancha FROM canchas c JOIN sedes s ON c.id_sede = s.id_sede
+            WHERE c.id_cancha = %s AND s.id_empresa = %s
+        """
+        cursor.execute(query_check, (id_cancha, id_empresa))
+        cancha_valida = cursor.fetchone()
+        
+        if not cancha_valida:
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "No tienes permiso para eliminar esta cancha."}), 403
+
+        # 2. Borramos en cascada (primero tarifas, luego la cancha)
+        # (Si tuvieras reseñas, también deberías borrarlas, pero están ligadas a reservas)
+        cursor.execute("DELETE FROM tarifas WHERE id_cancha = %s", (id_cancha,))
+        cursor.execute("DELETE FROM canchas WHERE id_cancha = %s", (id_cancha,))
+        conn.commit()
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify({"mensaje": "Cancha eliminada permanentemente"}), 200
+
+    except mysql.connector.Error as err:
+        conn.rollback()
+        if err.errno == 1451: # Error de llave foránea (si tiene reservas)
+            return jsonify({"error": "No se puede eliminar la cancha porque tiene reservas asociadas."}), 409
+        print(f"Error en DELETE /api/empresa/canchas/<id>: {err}")
+        return jsonify({"error": "Error al eliminar la cancha"}), 500
+
+@app.route('/api/empresa/mi-solicitud', methods=['GET'])
+def get_mi_solicitud():
+    id_usuario = get_user_id_from_token()
+    if not id_usuario:
+        return jsonify({"error": "No autorizado."}), 401
+
+    try:
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+        
+        # Buscamos la empresa vinculada a este usuario
+        cursor.execute("SELECT estado, motivo_rechazo FROM empresas WHERE id_usuario_admin = %s", (id_usuario,))
+        solicitud = cursor.fetchone()
+        
+        cursor.close()
+        conn.close()
+        
+        if not solicitud:
+            # Si no hay solicitud, no es un error, solo significa que aún no ha aplicado
+            return jsonify({"estado": None}), 200 
+            
+        return jsonify(solicitud)
+
+    except Exception as e:
+        print(f"Error en GET /api/empresa/mi-solicitud: {e}")
+        return jsonify({"error": "Error al obtener la solicitud"}), 500
+
+@app.route('/api/empresa/mi-solicitud', methods=['DELETE'])
+def eliminar_mi_solicitud():
+    id_usuario = get_user_id_from_token()
+    if not id_usuario:
+        return jsonify({"error": "No autorizado."}), 401
+    
+    try:
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+        
+        # El usuario solo puede borrar su solicitud si está 'rechazada'
+        query = "DELETE FROM empresas WHERE id_usuario_admin = %s AND estado = 'rechazado'"
+        cursor.execute(query, (id_usuario,))
+        conn.commit()
+        
+        affected_rows = cursor.rowcount
+        cursor.close()
+        conn.close()
+        
+        if affected_rows == 0:
+            return jsonify({"error": "No se encontró una solicitud rechazada para eliminar."}), 404
+            
+        return jsonify({"mensaje": "Solicitud eliminada. Ya puedes aplicar de nuevo."}), 200
+
+    except Exception as e:
+        conn.rollback()
+        print(f"Error en DELETE /api/empresa/mi-solicitud: {e}")
+        return jsonify({"error": "Error al eliminar la solicitud"}), 500
+
+@app.route('/api/empresa/mi-empresa', methods=['GET'])
+def get_mi_empresa_datos():
+    id_empresa, error_msg = get_empresa_id_from_token()
+    if error_msg:
+        return jsonify({"error": error_msg}), 403
+
+    try:
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+        
+        # Obtenemos los datos actuales de la empresa
+        cursor.execute("SELECT nombre, ruc, descripcion FROM empresas WHERE id_empresa = %s", (id_empresa,))
+        empresa_datos = cursor.fetchone()
+        
+        cursor.close()
+        conn.close()
+        
+        if not empresa_datos:
+            return jsonify({"error": "No se encontraron datos de la empresa."}), 404
+            
+        return jsonify(empresa_datos)
+
+    except Exception as e:
+        print(f"Error en GET /api/empresa/mi-empresa: {e}")
+        return jsonify({"error": "Error al obtener los datos de la empresa"}), 500
+
+@app.route('/api/empresa/mi-empresa', methods=['PUT'])
+def update_mi_empresa_datos():
+    id_empresa, error_msg = get_empresa_id_from_token()
+    if error_msg:
+        return jsonify({"error": error_msg}), 403
+
+    try:
+        data = request.json
+        nombre = data.get('nombre')
+        descripcion = data.get('descripcion')
+        
+        if not nombre:
+            return jsonify({"error": "El nombre de la empresa es obligatorio."}), 400
+
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+        
+        # ¡Importante! Solo permitimos actualizar nombre y descripción. El RUC no se toca.
+        query = """
+            UPDATE empresas SET 
+                nombre = %s, 
+                descripcion = %s
+            WHERE id_empresa = %s
+        """
+        cursor.execute(query, (nombre, descripcion, id_empresa))
+        conn.commit()
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify({"mensaje": "Datos de la empresa actualizados."}), 200
+
+    except Exception as e:
+        conn.rollback()
+        print(f"Error en PUT /api/empresa/mi-empresa: {e}")
+        return jsonify({"error": "Error al actualizar los datos"}), 500
+
+# --- (Endpoints de Eliminación de Empresa - SPRINT 4) ---
+
+@app.route('/api/empresa/delete-check', methods=['GET'])
+def check_empresa_deletable():
+    id_empresa, error_msg = get_empresa_id_from_token()
+    if error_msg:
+        return jsonify({"error": error_msg}), 403
+
+    try:
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+        
+        # 1. Buscamos todas las canchas de esta empresa
+        cursor.execute("SELECT id_cancha FROM canchas c JOIN sedes s ON c.id_sede = s.id_sede WHERE s.id_empresa = %s", (id_empresa,))
+        canchas = cursor.fetchall()
+        
+        if canchas:
+            # 2. Verificamos si alguna de esas canchas tiene reservas activas
+            id_canchas = tuple(c['id_cancha'] for c in canchas)
+            placeholder = '%s'
+            if len(id_canchas) > 1:
+                placeholder = ', '.join(['%s'] * len(id_canchas))
+                
+            query_reservas = f"""
+                SELECT id_reserva FROM reservas 
+                WHERE id_cancha IN ({placeholder}) 
+                AND (estado = 'pendiente' OR estado = 'confirmada')
+                LIMIT 1;
+            """
+            cursor.execute(query_reservas, id_canchas)
+            reserva_activa = cursor.fetchone()
+            
+            if reserva_activa:
+                cursor.close()
+                conn.close()
+                return jsonify({"error": "No puedes eliminar tu negocio porque tienes reservas activas o pendientes. Debes cancelarlas primero."}), 409
+        
+        # Si no hay canchas o no hay reservas activas, se puede borrar
+        cursor.close()
+        conn.close()
+        return jsonify({"message": "OK"}), 200
+
+    except Exception as e:
+        print(f"Error en GET /api/empresa/delete-check: {e}")
+        return jsonify({"error": "Error al verificar el estado de la empresa"}), 500
+
+
+@app.route('/api/empresa/delete-confirm', methods=['POST'])
+def delete_empresa_confirm():
+    id_usuario = get_user_id_from_token()
+    id_empresa, error_msg = get_empresa_id_from_token()
+    if error_msg:
+        return jsonify({"error": error_msg}), 403
+
+    try:
+        data = request.json
+        password_plano = data['password']
+        
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+        
+        # 1. Verificamos la contraseña del usuario
+        cursor.execute("SELECT password FROM usuarios WHERE id_usuario = %s", (id_usuario,))
+        usuario = cursor.fetchone()
+        
+        if not usuario or not bcrypt.checkpw(password_plano.encode('utf-8'), usuario['password'].encode('utf-8')):
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "La contraseña es incorrecta."}), 401
+
+        # 2. Re-verificamos que no haya reservas activas (por si acaso)
+        cursor.execute("SELECT id_cancha FROM canchas c JOIN sedes s ON c.id_sede = s.id_sede WHERE s.id_empresa = %s", (id_empresa,))
+        canchas = cursor.fetchall()
+        
+        if canchas:
+            id_canchas = tuple(c['id_cancha'] for c in canchas)
+            placeholder = '%s'
+            if len(id_canchas) > 1:
+                placeholder = ', '.join(['%s'] * len(id_canchas))
+            
+            query_reservas = f"SELECT id_reserva FROM reservas WHERE id_cancha IN ({placeholder}) AND (estado = 'pendiente' OR estado = 'confirmada') LIMIT 1"
+            cursor.execute(query_reservas, id_canchas)
+            if cursor.fetchone():
+                cursor.close()
+                conn.close()
+                return jsonify({"error": "No se puede eliminar, se encontró una reserva activa."}), 409
+            
+            # 3. Procedemos con la eliminación en cascada
+            # (Asumimos que las reservas completadas/canceladas pueden quedarse huérfanas o borrarse)
+            # Por simplicidad, borraremos todo lo vinculado
+            
+            query_reservas_all = f"SELECT id_reserva FROM reservas WHERE id_cancha IN ({placeholder})"
+            cursor.execute(query_reservas_all, id_canchas)
+            reservas = cursor.fetchall()
+            
+            if reservas:
+                id_reservas = tuple(r['id_reserva'] for r in reservas)
+                res_placeholder = '%s'
+                if len(id_reservas) > 1:
+                    res_placeholder = ', '.join(['%s'] * len(id_reservas))
+                
+                cursor.execute(f"DELETE FROM reseñas WHERE id_reserva IN ({res_placeholder})", id_reservas)
+                cursor.execute(f"DELETE FROM pagos WHERE id_reserva IN ({res_placeholder})", id_reservas)
+                cursor.execute(f"DELETE FROM reservas WHERE id_reserva IN ({res_placeholder})", id_reservas)
+
+            cursor.execute(f"DELETE FROM favoritos WHERE id_cancha IN ({placeholder})", id_canchas)
+            cursor.execute(f"DELETE FROM tarifas WHERE id_cancha IN ({placeholder})", id_canchas)
+            cursor.execute(f"DELETE FROM canchas WHERE id_cancha IN ({placeholder})", id_canchas)
+        
+        # 4. Finalmente, borramos las sedes y la empresa
+        cursor.execute("DELETE FROM sedes WHERE id_empresa = %s", (id_empresa,))
+        cursor.execute("DELETE FROM empresas WHERE id_empresa = %s", (id_empresa,))
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        return jsonify({"mensaje": "Negocio eliminado exitosamente."}), 200
+
+    except Exception as e:
+        conn.rollback()
+        print(f"Error en POST /api/empresa/delete-confirm: {e}")
+        return jsonify({"error": "Error interno al eliminar el negocio"}), 500
+
+@app.route('/api/admin/empresas/<int:id_empresa>', methods=['PUT'])
+def admin_update_empresa(id_empresa):
+    id_usuario_admin = get_user_id_from_token()
+    if not id_usuario_admin:
+        return jsonify({"error": "No autorizado."}), 401
+        
+    try:
+        data = request.json
+        nombre = data.get('nombre')
+        ruc = data.get('ruc')
+
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+        
+        # 1. Validar que el usuario sea Administrador (rol 2)
+        cursor.execute("SELECT id_rol FROM usuarios WHERE id_usuario = %s", (id_usuario_admin,))
+        admin = cursor.fetchone()
+        if not admin or admin['id_rol'] != 2:
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "Acceso denegado."}), 403
+
+        # 2. Actualizar la empresa
+        query = "UPDATE empresas SET nombre = %s, ruc = %s WHERE id_empresa = %s"
+        cursor.execute(query, (nombre, ruc, id_empresa))
+        conn.commit()
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify({"mensaje": "Empresa actualizada por Admin."}), 200
+
+    except Exception as e:
+        conn.rollback()
+        print(f"Error en PUT /api/admin/empresas/<id>: {e}")
+        return jsonify({"error": "Error al actualizar empresa"}), 500
+
+@app.route('/api/admin/empresas/<int:id_empresa>/estado', methods=['PUT'])
+def admin_update_estado_empresa(id_empresa):
+    id_usuario_admin = get_user_id_from_token()
+    if not id_usuario_admin:
+        return jsonify({"error": "No autorizado."}), 401
+        
+    try:
+        data = request.json
+        nuevo_estado = data.get('estado') # 'activo' o 'rechazado'
+        
+        if nuevo_estado not in ['activo', 'rechazado']:
+            return jsonify({"error": "Estado no válido."}), 400
+
+        conn = get_db_connection()
+        if conn is None: return jsonify({"error": "Error de conexión"}), 500
+        cursor = conn.cursor(dictionary=True)
+
+        # 1. Validar que el usuario sea Administrador (rol 2)
+        cursor.execute("SELECT id_rol FROM usuarios WHERE id_usuario = %s", (id_usuario_admin,))
+        admin = cursor.fetchone()
+        if not admin or admin['id_rol'] != 2:
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "Acceso denegado."}), 403
+
+        # 2. Actualizar estado (y limpiar motivo si se aprueba)
+        query = "UPDATE empresas SET estado = %s, motivo_rechazo = CASE WHEN %s = 'activo' THEN NULL ELSE motivo_rechazo END WHERE id_empresa = %s"
+        cursor.execute(query, (nuevo_estado, nuevo_estado, id_empresa))
+        conn.commit()
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify({"mensaje": f"Estado de la empresa actualizado a '{nuevo_estado}'."}), 200
+
+    except Exception as e:
+        conn.rollback()
+        print(f"Error en PUT /api/admin/empresas/<id>/estado: {e}")
+        return jsonify({"error": "Error al actualizar estado"}), 500
+
+def generar_pdf_comprobante(reserva_id):
+    """Función helper para generar el PDF de un comprobante."""
+    conn = get_db_connection()
+    if conn is None: raise Exception("Error de conexión")
+    
+    cursor = conn.cursor(dictionary=True)
+    # Obtenemos todos los datos para el comprobante
+    query = """
+        SELECT 
+            r.id_reserva, r.fecha_hora_inicio, r.precio_total,
+            p.id_transaccion_externa, p.metodo_pago, p.fecha_pago,
+            u.first_name, u.last_name, u.email,
+            c.nombre AS cancha_nombre,
+            s.nombre_sede, s.ubicacion_texto
+        FROM reservas r
+        JOIN pagos p ON r.id_reserva = p.id_reserva
+        JOIN usuarios u ON r.id_usuario = u.id_usuario
+        JOIN canchas c ON r.id_cancha = c.id_cancha
+        JOIN sedes s ON c.id_sede = s.id_sede
+        WHERE r.id_reserva = %s
+    """
+    cursor.execute(query, (reserva_id,))
+    data = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    
+    if not data:
+        raise Exception("Reserva no encontrada o sin pago.")
+        
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+    
+    pdf.set_font("Arial", 'B', 16)
+    pdf.cell(0, 10, 'Comprobante de Pago - CanchApp', 0, 1, 'C')
+    pdf.ln(10)
+    
+    pdf.set_font("Arial", 'B', 12)
+    pdf.cell(0, 8, f"Reserva #{data['id_reserva']} - {data['cancha_nombre']}", 0, 1)
+    pdf.set_font("Arial", size=12)
+    pdf.cell(0, 6, f"Sede: {data['nombre_sede']} ({data['ubicacion_texto']})", 0, 1)
+    pdf.cell(0, 6, f"Fecha: {data['fecha_hora_inicio'].strftime('%d/%m/%Y a las %I:%M %p')}", 0, 1)
+    pdf.ln(5)
+
+    pdf.set_font("Arial", 'B', 12)
+    pdf.cell(0, 8, "Datos del Cliente:", 0, 1)
+    pdf.set_font("Arial", size=12)
+    pdf.cell(0, 6, f"Cliente: {data['first_name']} {data['last_name']}", 0, 1)
+    pdf.cell(0, 6, f"Email: {data['email']}", 0, 1)
+    pdf.ln(5)
+
+    pdf.set_font("Arial", 'B', 12)
+    pdf.cell(0, 8, "Detalles del Pago:", 0, 1)
+    pdf.set_font("Arial", size=12)
+    pdf.cell(0, 6, f"Monto Pagado: S/ {data['precio_total']:.2f}", 0, 1)
+    pdf.cell(0, 6, f"Metodo: {data['metodo_pago']}", 0, 1)
+    pdf.cell(0, 6, f"Nro. Operacion: {data['id_transaccion_externa']}", 0, 1)
+    pdf.cell(0, 6, f"Fecha de Pago: {data['fecha_pago'].strftime('%d/%m/%Y %H:%M:%S')}", 0, 1)
+    
+    # Genera el PDF en memoria
+    pdf_bytes = pdf.output(dest='S').encode('latin-1')
+    return io.BytesIO(pdf_bytes), data # Devuelve el PDF y los datos
+
+
+@app.route('/api/reservas/<int:id_reserva>/comprobante-pdf', methods=['GET'])
+def descargar_comprobante(id_reserva):
+    id_usuario = get_user_id_from_token()
+    if not id_usuario:
+        return jsonify({"error": "No autorizado."}), 401
+    
+    try:
+        pdf_buffer, data = generar_pdf_comprobante(id_reserva)
+        
+        return send_file(
+            pdf_buffer,
+            mimetype='application/pdf',
+            as_attachment=True,
+            download_name=f"comprobante_canchapp_{id_reserva}.pdf"
+        )
+    except Exception as e:
+        print(f"Error al generar PDF: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/reservas/<int:id_reserva>/enviar-comprobante', methods=['POST'])
+def enviar_comprobante_email(id_reserva):
+    id_usuario = get_user_id_from_token()
+    if not id_usuario:
+        return jsonify({"error": "No autorizado."}), 401
+    
+    try:
+        pdf_buffer, data = generar_pdf_comprobante(id_reserva)
+        
+        msg = Message(
+            subject=f"Tu comprobante de reserva #{data['id_reserva']} en CanchApp",
+            sender=("CanchApp", app.config['MAIL_USERNAME']),
+            recipients=[data['email']]
+        )
+        msg.body = f"""
+        ¡Hola, {data['first_name']}!
+        
+        Gracias por tu pago. Adjuntamos el comprobante de tu reserva para:
+        
+        Cancha: {data['cancha_nombre']}
+        Fecha: {data['fecha_hora_inicio'].strftime('%d/%m/%Y a las %I:%M %p')}
+        Monto: S/ {data['precio_total']:.2f}
+        
+        ¡Nos vemos en la cancha!
+        """
+        
+        # Adjuntamos el PDF
+        msg.attach(
+            f"comprobante_canchapp_{id_reserva}.pdf",
+            "application/pdf",
+            pdf_buffer.read()
+        )
+        
+        mail.send(msg)
+        return jsonify({"mensaje": f"Comprobante enviado exitosamente a {data['email']}."}), 200
+
+    except Exception as e:
+        print(f"Error al enviar email: {e}")
+        return jsonify({"error": str(e)}), 500
 
 # --- ESTO SIEMPRE DEBE IR AL FINAL ---
 if __name__ == '__main__':
