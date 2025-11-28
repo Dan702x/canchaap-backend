@@ -22,7 +22,11 @@ app = Flask(__name__)
 CORS(
     app, 
     resources={r"/api/.*": {
-        "origins": ["*"],
+        "origins": [
+            "http://localhost:5173", 
+            "http://127.0.0.1:5173",
+            "https://cannchapp.netlify.app"  # <--- ¡AGREGA ESTO! (Tu URL exacta sin barra al final)
+        ],
         "methods": ["GET", "POST", "PUT", "DELETE"],
         "supports_credentials": True,
         "wildcard": True
@@ -474,7 +478,8 @@ def login_usuario():
             'token', 
             token,  # <-- ¡Arreglado!
             httponly=True, 
-            samesite='Lax', 
+            samesite='None',
+            secure=True,
             max_age=60*60*24
         )
         return resp
@@ -984,7 +989,7 @@ def delete_account():
         cursor.close()
         conn.close()
         resp = make_response(jsonify({"mensaje": "El perfil se ha eliminado correctamente"}))
-        resp.set_cookie('token', '', httponly=True, samesite='Lax', expires=0) 
+        resp.set_cookie('token', '', httponly=True, samesite='None', secure=True, expires=0) 
         return resp
     except mysql.connector.Error as err:
         conn.rollback() 
