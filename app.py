@@ -76,7 +76,7 @@ def send_verification_email(to_email, code):
     except Exception as e:
         print(f"¡ERROR AL ENVIAR CORREO DE VERIFICACIÓN! {e}")
         # ¡IMPORTANTE! Lanzamos el error para que /register haga rollback
-        raise e 
+        # raise e 
 
 # --- ¡NUEVA FUNCIÓN DE CORREO! (HU-022) ---
 def send_reminder_email(to_email, first_name, cancha_nombre, sede_nombre, fecha_hora_inicio):
