@@ -75,8 +75,6 @@ def send_verification_email(to_email, code):
         print(f"--- Correo de verificación enviado exitosamente a {to_email} ---")
     except Exception as e:
         print(f"¡ERROR AL ENVIAR CORREO DE VERIFICACIÓN! {e}")
-        # ¡IMPORTANTE! Lanzamos el error para que /register haga rollback
-        # raise e 
 
 # --- ¡NUEVA FUNCIÓN DE CORREO! (HU-022) ---
 def send_reminder_email(to_email, first_name, cancha_nombre, sede_nombre, fecha_hora_inicio):
@@ -314,7 +312,6 @@ def procesar_pago():
 
 @app.route('/api/register', methods=['POST'])
 def registrar_usuario():
-    # ¡MODIFICADO! Con manejo de error de envío
     try:
         data = request.json
         nombre_completo = data['nombre']
@@ -355,7 +352,6 @@ def registrar_usuario():
         try:
             send_verification_email(email, verification_code)
         except Exception as e:
-            # Si el correo falla, le avisamos al usuario y borramos el usuario
             print(f"¡ERROR AL ENVIAR CORREO! {e}")
             cursor.execute("DELETE FROM usuarios WHERE id_usuario = %s", (id_usuario,))
             conn.commit()
@@ -375,7 +371,6 @@ def registrar_usuario():
 
 @app.route('/api/verify-email', methods=['POST'])
 def verify_email():
-    # (Sin cambios)
     try:
         data = request.json
         email = data.get('email')
