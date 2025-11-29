@@ -15,6 +15,7 @@ from flask_mail import Mail, Message
 from fpdf import FPDF
 from flask import send_file
 import io
+from threading import Thread
 
 app = Flask(__name__)
 
@@ -310,6 +311,13 @@ def procesar_pago():
 
 # --- Endpoints SPRINT 2 y 3 (Con Verificación de Correo) ---
 
+def send_async_email(app, email, code):
+    with app.app_context():
+        try:
+            send_verification_email(email, code)
+        except Exception as e:
+            print(f"Error enviando correo en segundo plano: {e}")
+
 @app.route('/api/register', methods=['POST'])
 def registrar_usuario():
     try:
@@ -350,18 +358,15 @@ def registrar_usuario():
         id_usuario = cursor.lastrowid
         
         try:
-            send_verification_email(email, verification_code)
+            # Enviamos el correo en un hilo paralelo para no congelar al usuario
+            Thread(target=send_async_email, args=(app, email, verification_code)).start()
         except Exception as e:
-            print(f"¡ERROR AL ENVIAR CORREO! {e}")
-            cursor.execute("DELETE FROM usuarios WHERE id_usuario = %s", (id_usuario,))
-            conn.commit()
-            cursor.close()
-            conn.close()
-            return jsonify({"error": "No se pudo enviar el correo de verificación. Revisa la configuración del servidor de correo."}), 500
+            print(f"Error al iniciar el hilo de correo: {e}")
+            # No detenemos el registro, el usuario ya está guardado.
 
         cursor.close()
         conn.close()
-        return jsonify({"id_usuario": id_usuario, "mensaje": "Usuario registrado. Por favor, revisa tu email para el código de verificación."}), 201
+        return jsonify({"id_usuario": id_usuario, "mensaje": "Usuario registrado. Revisa tu email."}), 201
 
     except mysql.connector.Error as err:
         if err.errno == 1062:
