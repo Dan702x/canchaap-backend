@@ -634,28 +634,55 @@ def cancelar_reserva(id):
     id_usuario = get_user_id_from_token()
     if not id_usuario:
         return jsonify({"error": "No autorizado."}), 401
+
     try:
         conn = get_db_connection()
         if conn is None: return jsonify({"error": "Error de conexión"}), 500
         cursor = conn.cursor(dictionary=True)
+        
+        # Obtenemos la reserva
         cursor.execute(
             "SELECT fecha_hora_inicio, estado FROM reservas WHERE id_reserva = %s AND id_usuario = %s",
             (id, id_usuario) 
         )
         reserva = cursor.fetchone()
+        
         if not reserva:
+            cursor.close()
+            conn.close()
             return jsonify({"error": "Reserva no encontrada o no te pertenece."}), 404
-        if reserva['estado'] != 'confirmada':
-            return jsonify({"error": "Esta reserva no se puede cancelar."}), 400
-        ahora = datetime.now()
-        inicio_reserva = reserva['fecha_hora_inicio']
-        if (inicio_reserva - ahora) < timedelta(hours=24):
-            return jsonify({"error": "No puedes cancelar una reserva con menos de 24 horas de anticipación."}), 400
+
+        # --- AQUÍ ESTÁ EL CAMBIO DE LÓGICA ---
+        estado_actual = reserva['estado']
+
+        # 1. Si ya está cancelada o completada, no hacemos nada
+        if estado_actual in ['cancelada', 'completada']:
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "Esta reserva ya está finalizada o cancelada."}), 400
+
+        # 2. Si está CONFIRMADA (Pagada), aplicamos la regla de 24 horas
+        if estado_actual == 'confirmada':
+            ahora = datetime.now()
+            inicio_reserva = reserva['fecha_hora_inicio']
+            if (inicio_reserva - ahora) < timedelta(hours=24):
+                cursor.close()
+                conn.close()
+                return jsonify({"error": "No puedes cancelar una reserva pagada con menos de 24 horas de anticipación."}), 400
+
+        # 3. Si está PENDIENTE, permitimos cancelar inmediatamente (pasa directo)
+        
+        # --- FIN DEL CAMBIO ---
+
+        # Ejecutamos la cancelación
         cursor.execute("UPDATE reservas SET estado = 'cancelada' WHERE id_reserva = %s", (id,))
         conn.commit()
+        
         cursor.close()
         conn.close()
+        
         return jsonify({"mensaje": "Reserva cancelada exitosamente"})
+
     except mysql.connector.Error as err:
         print(f"Error en PUT /api/reservas/<id>/cancelar: {err}")
         return jsonify({"error": "Error al cancelar la reserva"}), 500
@@ -2154,18 +2181,18 @@ def admin_update_estado_empresa(id_empresa):
         return jsonify({"error": "Error al actualizar estado"}), 500
 
 def generar_pdf_comprobante(reserva_id):
-    """Función helper para generar el PDF de un comprobante."""
+    """Función helper para generar el PDF de un comprobante con diseño profesional."""
     conn = get_db_connection()
     if conn is None: raise Exception("Error de conexión")
     
     cursor = conn.cursor(dictionary=True)
     
-    # 1. La consulta (como la teníamos)
+    # 1. Consulta de datos
     query = """
         SELECT 
             r.id_reserva, r.fecha_hora_inicio, r.precio_total,
             p.id_transaccion_externa, p.metodo_pago, p.fecha_pago,
-            u.first_name, u.last_name, u.email,
+            u.first_name, u.last_name, u.email, u.documento,
             c.nombre AS cancha_nombre,
             s.nombre_sede, s.ubicacion_texto,
             e.nombre AS empresa_nombre, e.ruc AS empresa_ruc
@@ -2187,69 +2214,162 @@ def generar_pdf_comprobante(reserva_id):
         
     pdf = FPDF()
     pdf.add_page()
-    pdf.set_font("Arial", size=12)
     
-    # --- ¡NUEVA FUNCIÓN DE SANITIZACIÓN! ---
-    # Esto limpia los textos para que FPDF los acepte
     def sanitize(text):
-        if text is None:
-            return ''
-        # Convierte a string, codifica a latin-1 (reemplazando ?), y decodifica de vuelta.
+        if text is None: return ''
         return str(text).encode('latin-1', 'replace').decode('latin-1')
-    # --- FIN DE LA NUEVA FUNCIÓN ---
 
-    page_width = 210
-    margin = 20
-    content_width = page_width - (2 * margin)
+    # --- DISEÑO DEL COMPROBANTE ---
     
-    pdf.set_left_margin(margin)
-    pdf.set_right_margin(margin)
+    # Variables de posición
+    left_col_width = 115
+    right_col_x = 130
+    top_margin = 10
+    
+    pdf.set_xy(10, top_margin)
 
+    # 1. CABECERA (Izquierda)
     pdf.set_font("Arial", 'B', 16)
-    pdf.cell(0, 10, 'Comprobante de Pago - CanchApp', 0, 1, 'C')
-    pdf.ln(10)
     
-    start_y = pdf.get_y() 
-
-    # --- ¡TEXTOS SANITIZADOS! ---
-    pdf.set_font("Arial", 'B', 12)
-    pdf.cell(0, 8, "Datos del Negocio:", 0, 1)
-    pdf.set_font("Arial", size=12)
-    pdf.cell(0, 6, f"Razon Social: {sanitize(data['empresa_nombre'])}", 0, 1)
-    pdf.cell(0, 6, f"RUC: {sanitize(data['empresa_ruc'])}", 0, 1)
-    pdf.cell(0, 6, f"Sede: {sanitize(data['nombre_sede'])}", 0, 1)
-    pdf.ln(5)
-
-    pdf.set_font("Arial", 'B', 12)
-    pdf.cell(0, 8, f"Reserva #{data['id_reserva']} - {sanitize(data['cancha_nombre'])}", 0, 1)
-    pdf.set_font("Arial", size=12)
-    pdf.cell(0, 6, f"Fecha: {data['fecha_hora_inicio'].strftime('%d/%m/%Y a las %I:%M %p')}", 0, 1)
-    pdf.ln(5)
-
-    pdf.set_font("Arial", 'B', 12)
-    pdf.cell(0, 8, "Datos del Cliente:", 0, 1)
-    pdf.set_font("Arial", size=12)
-    pdf.cell(0, 6, f"Cliente: {sanitize(data['first_name'])} {sanitize(data['last_name'])}", 0, 1)
-    pdf.cell(0, 6, f"Email: {sanitize(data['email'])}", 0, 1)
-    pdf.ln(5)
-
-    pdf.set_font("Arial", 'B', 12)
-    pdf.cell(0, 8, "Detalles del Pago:", 0, 1)
-    pdf.set_font("Arial", size=12)
-    pdf.cell(0, 6, f"Monto Pagado: S/ {data['precio_total']:.2f}", 0, 1)
-    pdf.cell(0, 6, f"Metodo: {sanitize(data['metodo_pago'])}", 0, 1)
-    pdf.cell(0, 6, f"Nro. Operacion: {sanitize(data['id_transaccion_externa'])}", 0, 1)
-    pdf.cell(0, 6, f"Fecha de Pago: {data['fecha_pago'].strftime('%d/%m/%Y %H:%M:%S')}", 0, 1)
-    pdf.ln(5)
+    # Guardamos X para alinear
+    current_x = pdf.get_x()
+    pdf.multi_cell(left_col_width, 8, sanitize(data['empresa_nombre']), 0, 'L')
     
-    end_y = pdf.get_y()
-    pdf.rect(margin, start_y, content_width, end_y - start_y)
+    # --- ¡CAMBIO! Añadimos un pequeño espacio antes de la dirección ---
+    pdf.ln(2) 
     
-    # --- ¡CORRECCIÓN FINAL! ---
-    # pdf.output(dest='S') ya devuelve bytes, no necesitamos .encode()
+    # Reseteamos X y cambiamos fuente
+    pdf.set_x(current_x)
+    pdf.set_font("Arial", '', 9)
+    pdf.multi_cell(left_col_width, 5, sanitize(data['nombre_sede']), 0, 'L')
+    
+    pdf.set_x(current_x)
+    pdf.multi_cell(left_col_width, 5, sanitize(data['ubicacion_texto']), 0, 'L')
+    
+    pdf.set_x(current_x)
+    pdf.cell(left_col_width, 5, "Email: contacto@canchapp.com", 0, 1, 'L')
+    
+    # Guardamos hasta dónde llegó la izquierda para no chocar luego
+    y_final_izquierda = pdf.get_y()
+
+    # (Derecha) Cuadro de RUC y Número
+    # Volvemos arriba a la derecha
+    pdf.set_xy(right_col_x, top_margin) 
+    pdf.set_font("Arial", 'B', 11)
+    
+    # Dibujamos el borde
+    pdf.rect(right_col_x, top_margin, 70, 30)
+    
+    # --- ¡CORRECCIÓN VITAL AQUÍ! ---
+    # Usamos set_x(right_col_x) antes de CADA línea para que no se vaya a la izquierda
+    
+    # Línea 1: RUC
+    pdf.set_x(right_col_x) 
+    pdf.cell(70, 8, f"R.U.C. {sanitize(data['empresa_ruc'])}", 0, 1, 'C')
+    
+    # Línea 2: Fondo Negro
+    pdf.set_x(right_col_x) # <--- ESTO ARREGLA LA SUPERPOSICIÓN
+    pdf.set_fill_color(0, 0, 0)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(70, 8, "COMPROBANTE ELECTRONICO", 1, 1, 'C', True)
+    
+    # Línea 3: Número de serie
+    pdf.set_x(right_col_x) # <--- ESTO TAMBIÉN
+    pdf.set_text_color(0, 0, 0)
+    numero_comprobante = f"E001-{int(data['id_reserva']):06d}"
+    pdf.cell(70, 14, numero_comprobante, 0, 1, 'C')
+
+    # Calculamos dónde seguir (el máximo entre la izquierda y la caja derecha)
+    y_start_body = max(y_final_izquierda, 55) 
+    pdf.set_y(y_start_body)
+    pdf.ln(5)
+
+    # 2. DATOS DEL CLIENTE (Resto igual...)
+    pdf.set_font("Arial", 'B', 9)
+    pdf.cell(30, 6, "CLIENTE:", 0, 0)
+    pdf.set_font("Arial", '', 9)
+    pdf.cell(90, 6, f"{sanitize(data['first_name'])} {sanitize(data['last_name'])}", 0, 0)
+    
+    pdf.set_font("Arial", 'B', 9)
+    pdf.cell(30, 6, "FECHA EMISION:", 0, 0)
+    pdf.set_font("Arial", '', 9)
+    fecha_pago = data['fecha_pago'].strftime('%d/%m/%Y') if data['fecha_pago'] else datetime.now().strftime('%d/%m/%Y')
+    pdf.cell(40, 6, fecha_pago, 0, 1)
+
+    pdf.set_font("Arial", 'B', 9)
+    pdf.cell(30, 6, "DOC. IDENTIDAD:", 0, 0)
+    pdf.set_font("Arial", '', 9)
+    pdf.cell(90, 6, sanitize(data['documento'] or '-'), 0, 0)
+
+    pdf.set_font("Arial", 'B', 9)
+    pdf.cell(30, 6, "MONEDA:", 0, 0)
+    pdf.set_font("Arial", '', 9)
+    pdf.cell(40, 6, "SOLES", 0, 1)
+    
+    pdf.ln(5)
+
+    # 3. TABLA DE ÍTEMS
+    pdf.set_fill_color(240, 240, 240)
+    pdf.set_font("Arial", 'B', 9)
+    pdf.cell(15, 8, "CANT.", 1, 0, 'C', True)
+    pdf.cell(115, 8, "DESCRIPCION", 1, 0, 'L', True)
+    pdf.cell(30, 8, "P. UNIT", 1, 0, 'R', True)
+    pdf.cell(30, 8, "IMPORTE", 1, 1, 'R', True)
+    
+    pdf.set_font("Arial", '', 9)
+    pdf.cell(15, 8, "1", 1, 0, 'C')
+    
+    fecha_reserva_str = data['fecha_hora_inicio'].strftime('%d/%m/%Y %H:%M')
+    
+    # Guardamos posición para la descripción multilínea
+    current_x_table = pdf.get_x()
+    current_y_table = pdf.get_y()
+    
+    descripcion_item = f"Alquiler de Cancha: {sanitize(data['cancha_nombre'])} ({fecha_reserva_str})"
+    pdf.multi_cell(115, 8, descripcion_item, 1, 'L')
+    
+    # Volvemos a la derecha para el precio
+    pdf.set_xy(current_x_table + 115, current_y_table)
+
+    precio_str = f"{data['precio_total']:.2f}"
+    pdf.cell(30, 8, precio_str, 1, 0, 'R')
+    pdf.cell(30, 8, precio_str, 1, 1, 'R')
+    
+    pdf.ln(max(8, pdf.get_y() - current_y_table))
+
+    # 4. TOTALES
+    total = float(data['precio_total'])
+    subtotal = total / 1.18
+    igv = total - subtotal
+    
+    start_x_totals = 140
+    
+    pdf.set_x(start_x_totals)
+    pdf.cell(20, 6, "OP. GRAVADA", 0, 0, 'R')
+    pdf.cell(30, 6, f"S/ {subtotal:.2f}", 0, 1, 'R')
+    
+    pdf.set_x(start_x_totals)
+    pdf.cell(20, 6, "I.G.V. (18%)", 0, 0, 'R')
+    pdf.cell(30, 6, f"S/ {igv:.2f}", 0, 1, 'R')
+    
+    pdf.set_x(start_x_totals)
+    pdf.set_font("Arial", 'B', 10)
+    pdf.cell(20, 8, "TOTAL", 0, 0, 'R')
+    pdf.cell(30, 8, f"S/ {total:.2f}", 1, 1, 'R')
+
+    # 5. PIE DE PÁGINA
+    pdf.set_y(-50)
+    pdf.set_font("Arial", '', 8)
+    pdf.cell(0, 5, "Informacion de Pago:", 0, 1, 'L')
+    pdf.cell(0, 5, f"Metodo: {sanitize(data['metodo_pago'])}", 0, 1, 'L')
+    pdf.cell(0, 5, f"ID Transaccion: {sanitize(data['id_transaccion_externa'])}", 0, 1, 'L')
+    
+    pdf.ln(5)
+    pdf.set_font("Arial", 'I', 8)
+    pdf.cell(0, 5, "Gracias por confiar en CanchApp. Este documento no tiene valor fiscal oficial.", 0, 1, 'C')
+
     pdf_bytes = pdf.output(dest='S').encode('latin-1')
-    
-    return io.BytesIO(pdf_bytes), data # Devuelve el PDF y los datos
+    return io.BytesIO(pdf_bytes), data
 
 
 @app.route('/api/reservas/<int:id_reserva>/comprobante-pdf', methods=['GET'])
