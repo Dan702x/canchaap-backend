@@ -2271,6 +2271,31 @@ def descargar_comprobante(id_reserva):
         print(f"Error al generar PDF: {e}")
         return jsonify({"error": str(e)}), 500
 
+# Función auxiliar para enviar comprobante en segundo plano
+def send_async_comprobante(app, id_reserva, email_usuario):
+    with app.app_context():
+        try:
+            # Reutilizamos la lógica que ya tenías dentro de la ruta
+            pdf_buffer, data = generar_pdf_comprobante(id_reserva)
+            
+            msg = Message(
+                subject=f"Tu comprobante de reserva #{data['id_reserva']} en CanchApp",
+                sender=("CanchApp", app.config['MAIL_USERNAME']),
+                recipients=[data['email']]
+            )
+            msg.body = f"Hola {data['first_name']}, adjuntamos tu comprobante."
+            
+            msg.attach(
+                f"comprobante_{id_reserva}.pdf",
+                "application/pdf",
+                pdf_buffer.read()
+            )
+            mail.send(msg)
+            print(f"--- Comprobante enviado a {data['email']} ---")
+        except Exception as e:
+            print(f"Error enviando comprobante background: {e}")
+
+
 @app.route('/api/reservas/<int:id_reserva>/enviar-comprobante', methods=['POST'])
 def enviar_comprobante_email(id_reserva):
     id_usuario = get_user_id_from_token()
@@ -2278,37 +2303,22 @@ def enviar_comprobante_email(id_reserva):
         return jsonify({"error": "No autorizado."}), 401
     
     try:
-        pdf_buffer, data = generar_pdf_comprobante(id_reserva)
-        
-        msg = Message(
-            subject=f"Tu comprobante de reserva #{data['id_reserva']} en CanchApp",
-            sender=("CanchApp", app.config['MAIL_USERNAME']),
-            recipients=[data['email']]
-        )
-        msg.body = f"""
-        ¡Hola, {data['first_name']}!
-        
-        Gracias por tu pago. Adjuntamos el comprobante de tu reserva para:
-        
-        Cancha: {data['cancha_nombre']}
-        Fecha: {data['fecha_hora_inicio'].strftime('%d/%m/%Y a las %I:%M %p')}
-        Monto: S/ {data['precio_total']:.2f}
-        
-        ¡Nos vemos en la cancha!
-        """
-        
-        # Adjuntamos el PDF
-        msg.attach(
-            f"comprobante_canchapp_{id_reserva}.pdf",
-            "application/pdf",
-            pdf_buffer.read()
-        )
-        
-        mail.send(msg)
-        return jsonify({"mensaje": f"Comprobante enviado exitosamente a {data['email']}."}), 200
+        # Recuperamos el email del usuario rápidamente
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT email FROM usuarios WHERE id_usuario = %s", (id_usuario,))
+        user_data = cursor.fetchone()
+        cursor.close()
+        conn.close()
+
+        if user_data:
+            # Lanzamos el hilo usando la función que acabas de pegar arriba
+            Thread(target=send_async_comprobante, args=(app, id_reserva, user_data['email'])).start()
+            
+        return jsonify({"mensaje": "El comprobante se está enviando a tu correo."}), 200
 
     except Exception as e:
-        print(f"Error al enviar email: {e}")
+        print(f"Error al iniciar envío: {e}")
         return jsonify({"error": str(e)}), 500
 
 # --- ¡NUEVO ENDPOINT! Para reseñas genéricas (HU-019) ---
