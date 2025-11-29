@@ -27,7 +27,7 @@ CORS(
             "http://127.0.0.1:5173",
             "https://cannchapp.netlify.app"  # <--- ¡AGREGA ESTO! (Tu URL exacta sin barra al final)
         ],
-        "methods": ["GET", "POST", "PUT", "DELETE"],
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         "supports_credentials": True,
         "wildcard": True
     }}
