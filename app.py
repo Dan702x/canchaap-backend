@@ -585,6 +585,16 @@ def manejar_reservas():
             conn = get_db_connection()
             if conn is None: return jsonify({"error": "Error de conexión"}), 500
             cursor = conn.cursor(dictionary=True)
+
+            query_update = """
+                UPDATE reservas 
+                SET estado = 'completada' 
+                WHERE estado = 'confirmada' 
+                AND fecha_hora_fin < NOW();
+            """
+            cursor.execute(query_update)
+            conn.commit() # Guardamos los cambios
+            
             query = """
             SELECT 
                 r.id_reserva, r.id_cancha, r.fecha_hora_inicio, 
