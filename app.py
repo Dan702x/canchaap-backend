@@ -586,14 +586,21 @@ def manejar_reservas():
             if conn is None: return jsonify({"error": "Error de conexión"}), 500
             cursor = conn.cursor(dictionary=True)
 
+            # --- CORRECCIÓN DE ZONA HORARIA ---
+            # 1. Calculamos la hora actual en PERÚ (UTC - 5 horas)
+            # datetime.utcnow() nos da la hora del servidor (UTC) y le restamos 5
+            now_peru = datetime.utcnow() - timedelta(hours=5)
+
+            # 2. Usamos esa hora en la consulta en lugar de NOW()
             query_update = """
                 UPDATE reservas 
                 SET estado = 'completada' 
                 WHERE estado = 'confirmada' 
-                AND fecha_hora_fin < NOW();
+                AND fecha_hora_fin < %s;  
             """
-            cursor.execute(query_update)
-            conn.commit() # Guardamos los cambios
+            # Pasamos la variable now_peru como parámetro (tupla de 1 elemento)
+            cursor.execute(query_update, (now_peru,))
+            conn.commit()
             
             query = """
             SELECT 
