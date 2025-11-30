@@ -357,20 +357,16 @@ def registrar_usuario():
         conn.commit()
         id_usuario = cursor.lastrowid
         
-        print("--- Iniciando intento de envío de correo SINCRONO ---")
         try:
-            send_verification_email(email, verification_code)
-            print("--- ¡Correo enviado correctamente! ---")
+            # Enviamos el correo en un hilo paralelo para no congelar al usuario
+            Thread(target=send_async_email, args=(app, email, verification_code)).start()
         except Exception as e:
-            # Aquí capturamos el error pero NO borramos el usuario ni retornamos 500
-            print(f"¡¡¡FALLÓ EL ENVÍO REAL!!! La razón es: {e}")
-            # El código sigue adelante...
+            print(f"Error al iniciar el hilo de correo: {e}")
+            # No detenemos el registro, el usuario ya está guardado.
 
         cursor.close()
         conn.close()
-        
-        # Le decimos al frontend que todo salió bien (aunque el correo haya fallado)
-        return jsonify({"id_usuario": id_usuario, "mensaje": "Usuario registrado."}), 201
+        return jsonify({"id_usuario": id_usuario, "mensaje": "Usuario registrado. Revisa tu email."}), 201
 
     except mysql.connector.Error as err:
         if err.errno == 1062:
