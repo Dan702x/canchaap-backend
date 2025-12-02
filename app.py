@@ -16,6 +16,8 @@ from fpdf import FPDF
 from flask import send_file
 import io
 from threading import Thread
+import requests
+import base64
 
 app = Flask(__name__)
 
@@ -64,18 +66,59 @@ def get_user_id_from_token():
         return None
 
 # --- Funciones de Envío de Correo ---
-def send_verification_email(to_email, code):
+# def send_verification_email(to_email, code):
+    #try:
+        #msg = Message(
+            #subject="¡Bienvenido a CanchApp! Verifica tu cuenta",
+            #sender=("CanchApp", app.config['MAIL_USERNAME']),
+            #recipients=[to_email]
+        #)
+        #msg.body = f"¡Gracias por registrarte en CanchApp!\nTu código de verificación es: {code}\n\nIngrésalo en la página para activar tu cuenta.\n\n- El equipo de CanchApp"
+        #mail.send(msg)
+        #print(f"--- Correo de verificación enviado exitosamente a {to_email} ---")
+    #except Exception as e:
+        #print(f"¡ERROR AL ENVIAR CORREO DE VERIFICACIÓN! {e}")
+
+# --- NUEVAS FUNCIONES PARA BREVO (API) ---
+
+def enviar_correo_brevo(to_email, subject, html_content, attachment=None):
+    url = "https://api.brevo.com/v3/smtp/email"
+    headers = {
+        "accept": "application/json",
+        "api-key": os.getenv('BREVO_API_KEY'),
+        "content-type": "application/json"
+    }
+    payload = {
+        "sender": {"name": "CanchApp", "email": "canchappdevs@gmail.com"},
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "htmlContent": html_content
+    }
+    if attachment:
+        payload["attachment"] = [attachment]
+
     try:
-        msg = Message(
-            subject="¡Bienvenido a CanchApp! Verifica tu cuenta",
-            sender=("CanchApp", app.config['MAIL_USERNAME']),
-            recipients=[to_email]
-        )
-        msg.body = f"¡Gracias por registrarte en CanchApp!\nTu código de verificación es: {code}\n\nIngrésalo en la página para activar tu cuenta.\n\n- El equipo de CanchApp"
-        mail.send(msg)
-        print(f"--- Correo de verificación enviado exitosamente a {to_email} ---")
+        response = requests.post(url, json=payload, headers=headers)
+        if response.status_code == 201:
+            print(f"--- [BREVO] Correo enviado a {to_email} ---")
+            return True
+        else:
+            print(f"--- [BREVO ERROR] {response.text} ---")
+            return False
     except Exception as e:
-        print(f"¡ERROR AL ENVIAR CORREO DE VERIFICACIÓN! {e}")
+        print(f"--- [BREVO EXCEPTION] {e} ---")
+        return False
+
+# Esta reemplaza a la antigua send_verification_email para que el código no se rompa
+def send_verification_email(to_email, code):
+    subject = "¡Bienvenido a CanchApp! Verifica tu cuenta"
+    message = f"""
+        <h1>Bienvenido a CanchApp</h1>
+        <p>Tu código de verificación es: <strong>{code}</strong></p>
+        <p>Ingrésalo en la página para activar tu cuenta.</p>
+    """
+    enviar_correo_brevo(to_email, subject, message)
+
 
 # --- ¡NUEVA FUNCIÓN DE CORREO! (HU-022) ---
 def send_reminder_email(to_email, first_name, cancha_nombre, sede_nombre, fecha_hora_inicio):
@@ -2412,23 +2455,20 @@ def descargar_comprobante(id_reserva):
 def send_async_comprobante(app, id_reserva, email_usuario):
     with app.app_context():
         try:
-            # Reutilizamos la lógica que ya tenías dentro de la ruta
+            # Generamos el PDF
             pdf_buffer, data = generar_pdf_comprobante(id_reserva)
+            # Preparamos adjunto para Brevo
+            pdf_content = base64.b64encode(pdf_buffer.read()).decode('utf-8')
+            attachment = {
+                "content": pdf_content,
+                "name": f"comprobante_{id_reserva}.pdf"
+            }
             
-            msg = Message(
-                subject=f"Tu comprobante de reserva #{data['id_reserva']} en CanchApp",
-                sender=("CanchApp", app.config['MAIL_USERNAME']),
-                recipients=[data['email']]
-            )
-            msg.body = f"Hola {data['first_name']}, adjuntamos tu comprobante."
+            asunto = f"Tu comprobante de reserva #{id_reserva}"
+            mensaje = f"<p>Hola {data['first_name']},</p><p>Adjuntamos tu comprobante de pago.</p>"
             
-            msg.attach(
-                f"comprobante_{id_reserva}.pdf",
-                "application/pdf",
-                pdf_buffer.read()
-            )
-            mail.send(msg)
-            print(f"--- Comprobante enviado a {data['email']} ---")
+            enviar_correo_brevo(email_usuario, asunto, mensaje, attachment)
+            
         except Exception as e:
             print(f"Error enviando comprobante background: {e}")
 
